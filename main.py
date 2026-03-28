@@ -130,6 +130,10 @@ app = FastAPI()
 # { conversa_id: { phone, name, message, data } }
 _conversas_pendentes: dict = {}
 
+# Cache de ctwa_clid por telefone — alimentado pelo ctwa-proxy diretamente
+# { phone: { ctwa_clid, ad_id } }
+_ctwa_por_telefone: dict = {}
+
 
 def _extrair_dados_contato(payload: dict) -> dict:
     contact = payload.get("meta", {}).get("sender", {})
@@ -154,6 +158,18 @@ def _processar_lead(payload: dict, ctwa_info: dict):
     registrar_lead(dados)
 
 
+@app.post("/internal/ctwa")
+async def receber_ctwa_do_proxy(request: Request):
+    """Recebe ctwa_clid diretamente do ctwa-proxy, indexado por telefone."""
+    data = await request.json()
+    phone = data.get("phone", "").replace("+", "").replace(" ", "")
+    ctwa_clid = data.get("ctwa_clid")
+    if phone and ctwa_clid:
+        _ctwa_por_telefone[phone] = {"ctwa_clid": ctwa_clid, "ad_id": data.get("ad_id")}
+        print(f"[CTWA] telefone {phone} → ctwa_clid recebido do proxy")
+    return {"status": "ok"}
+
+
 @app.post("/webhook/chatwoot")
 async def receber_chatwoot(
     request: Request,
@@ -169,12 +185,19 @@ async def receber_chatwoot(
     if event == "conversation_created":
         ctwa_info = extrair_ctwa(payload)
 
+        if not ctwa_info.get("ctwa_clid"):
+            # Tenta pelo cache do proxy (indexado por telefone)
+            contact = payload.get("meta", {}).get("sender", {})
+            phone = contact.get("phone_number", "").replace("+", "").replace(" ", "")
+            if phone in _ctwa_por_telefone:
+                ctwa_info = _ctwa_por_telefone.pop(phone)
+                print(f"[CTWA-CACHE] conversa {conversa_id} resolvida por telefone {phone}")
+
         if ctwa_info.get("ctwa_clid"):
-            # ctwa_clid já presente — registra imediatamente
             _processar_lead(payload, ctwa_info)
             return {"status": "ok"}
 
-        # Sem ctwa_clid ainda — guarda como pendente (proxy pode injetar em seguida)
+        # Sem ctwa_clid ainda — guarda como pendente
         _conversas_pendentes[conversa_id] = _extrair_dados_contato(payload)
         print(f"[PENDENTE] conversa {conversa_id} aguardando ctwa_clid")
         return {"status": "pending", "conversa_id": conversa_id}
