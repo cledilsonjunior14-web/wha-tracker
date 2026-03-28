@@ -126,56 +126,73 @@ def extrair_ctwa(payload: dict) -> dict:
 
 app = FastAPI()
 
+# Conversas aguardando ctwa_clid (race condition: proxy injeta após conversation_created)
+# { conversa_id: { phone, name, message, data } }
+_conversas_pendentes: dict = {}
 
-@app.post("/webhook/chatwoot")
-async def receber_chatwoot(
-    request: Request,
-    x_chatwoot_token: str = Header(None),  # token opcional de segurança
-):
-    # Valida token se configurado
-    if CHATWOOT_TOKEN and x_chatwoot_token != CHATWOOT_TOKEN:
-        raise HTTPException(status_code=401, detail="Token inválido")
 
-    payload = await request.json()
-    event = payload.get("event")
-
-    # Só processa quando uma nova conversa é criada
-    # (primeira mensagem = primeiro contato via anúncio)
-    if event != "conversation_created":
-        return {"status": "ignored", "event": event}
-
-    # Extrai ctwa_clid
-    ctwa_info = extrair_ctwa(payload)
-    ctwa_clid = ctwa_info.get("ctwa_clid")
-
-    if not ctwa_clid:
-        return {"status": "ignored", "reason": "sem ctwa_clid — não veio de anúncio"}
-
-    # Dados do contato
+def _extrair_dados_contato(payload: dict) -> dict:
     contact = payload.get("meta", {}).get("sender", {})
-    phone   = contact.get("phone_number", "").replace("+", "").replace(" ", "")
-    name    = contact.get("name", "")
-
-    # Primeira mensagem da conversa
     messages = payload.get("messages", [])
-    message  = messages[0].get("content", "") if messages else ""
-
-    dados = {
-        "data":       datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "phone":      phone,
-        "name":       name,
-        "message":    message,
-        "ctwa_clid":  ctwa_clid,
+    return {
+        "data":        datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "phone":       contact.get("phone_number", "").replace("+", "").replace(" ", ""),
+        "name":        contact.get("name", ""),
+        "message":     messages[0].get("content", "") if messages else "",
         "conversa_id": payload.get("id", ""),
     }
 
-    # Enriquece com dados do anúncio via Meta API
+
+def _processar_lead(payload: dict, ctwa_info: dict):
+    dados = _extrair_dados_contato(payload)
+    dados["ctwa_clid"] = ctwa_info.get("ctwa_clid")
+
     ad_id = ctwa_info.get("ad_id")
     if ad_id and META_ACCESS_TOKEN:
         dados.update(buscar_dados_anuncio(ad_id))
 
     registrar_lead(dados)
-    return {"status": "ok"}
+
+
+@app.post("/webhook/chatwoot")
+async def receber_chatwoot(
+    request: Request,
+    x_chatwoot_token: str = Header(None),
+):
+    if CHATWOOT_TOKEN and x_chatwoot_token != CHATWOOT_TOKEN:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+    payload = await request.json()
+    event = payload.get("event")
+    conversa_id = payload.get("id")
+
+    if event == "conversation_created":
+        ctwa_info = extrair_ctwa(payload)
+
+        if ctwa_info.get("ctwa_clid"):
+            # ctwa_clid já presente — registra imediatamente
+            _processar_lead(payload, ctwa_info)
+            return {"status": "ok"}
+
+        # Sem ctwa_clid ainda — guarda como pendente (proxy pode injetar em seguida)
+        _conversas_pendentes[conversa_id] = _extrair_dados_contato(payload)
+        print(f"[PENDENTE] conversa {conversa_id} aguardando ctwa_clid")
+        return {"status": "pending", "conversa_id": conversa_id}
+
+    if event == "conversation_updated" and conversa_id in _conversas_pendentes:
+        ctwa_info = extrair_ctwa(payload)
+
+        if ctwa_info.get("ctwa_clid"):
+            # ctwa_clid injetado pelo proxy — registra agora
+            dados = _conversas_pendentes.pop(conversa_id)
+            dados["ctwa_clid"] = ctwa_info.get("ctwa_clid")
+            ad_id = ctwa_info.get("ad_id")
+            if ad_id and META_ACCESS_TOKEN:
+                dados.update(buscar_dados_anuncio(ad_id))
+            registrar_lead(dados)
+            return {"status": "ok", "via": "conversation_updated"}
+
+    return {"status": "ignored", "event": event}
 
 
 @app.get("/")
