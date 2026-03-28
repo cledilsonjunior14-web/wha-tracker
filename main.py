@@ -6,6 +6,8 @@ e registra o contato em uma planilha do Google Sheets.
 """
 
 import os
+import hashlib
+import time
 from dotenv import load_dotenv
 load_dotenv()
 import requests
@@ -17,10 +19,12 @@ from google.oauth2.service_account import Credentials
 # ── CONFIGURAÇÕES ─────────────────────────────────────────────────────────────
 
 META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", "")
-CHATWOOT_TOKEN    = os.environ.get("CHATWOOT_WEBHOOK_TOKEN", "")  # opcional, para segurança
+CHATWOOT_TOKEN    = os.environ.get("CHATWOOT_WEBHOOK_TOKEN", "")
 SPREADSHEET_ID    = os.environ.get("SPREADSHEET_ID", "")
 SHEET_NAME        = os.environ.get("SHEET_NAME", "Leads")
 SERVICE_ACCOUNT   = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "service_account.json")
+PIXEL_ID          = os.environ.get("PIXEL_ID", "")
+PIXEL_TOKEN       = os.environ.get("PIXEL_TOKEN", "")
 
 BASE_URL = "https://graph.facebook.com/v19.0"
 
@@ -61,6 +65,7 @@ def registrar_lead(dados: dict):
         dados.get("conversa_id", ""),
     ])
     print(f"[{dados['data']}] Lead registrado: {dados.get('name') or dados.get('phone')} | campanha: {dados.get('campaign_name', '—')}")
+    disparar_pixel(dados)
 
 
 # ── META ADS ──────────────────────────────────────────────────────────────────
@@ -85,6 +90,54 @@ def buscar_dados_anuncio(ad_id: str) -> dict:
         }
     except Exception:
         return {}
+
+
+# ── META CONVERSIONS API (PIXEL) ─────────────────────────────────────────────
+
+def disparar_pixel(dados: dict):
+    if not PIXEL_ID or not PIXEL_TOKEN:
+        return
+
+    phone = dados.get("phone", "")
+    # Normaliza e hasheia o telefone (E.164 sem +, SHA256)
+    phone_hash = hashlib.sha256(phone.encode()).hexdigest() if phone else None
+
+    payload = {
+        "data": [{
+            "event_name": "Lead",
+            "event_time": int(time.time()),
+            "action_source": "system_generated",
+            "user_data": {
+                **({"ph": [phone_hash]} if phone_hash else {}),
+            },
+            "custom_data": {
+                "ctwa_clid":     dados.get("ctwa_clid", ""),
+                "campaign_name": dados.get("campaign_name", ""),
+                "adset_name":    dados.get("adset_name", ""),
+                "ad_name":       dados.get("ad_name", ""),
+            },
+        }],
+        "access_token": PIXEL_TOKEN,
+    }
+
+    # Inclui ctwa_clid no user_data para melhor match
+    ctwa = dados.get("ctwa_clid", "")
+    if ctwa:
+        payload["data"][0]["user_data"]["ctwa_clid"] = ctwa
+
+    try:
+        r = requests.post(
+            f"{BASE_URL}/{PIXEL_ID}/events",
+            json=payload,
+            timeout=10,
+        )
+        result = r.json()
+        if "error" in result:
+            print(f"[PIXEL] erro: {result['error'].get('message')}")
+        else:
+            print(f"[PIXEL] Lead disparado | events_received={result.get('events_received')}")
+    except Exception as e:
+        print(f"[PIXEL] falha no disparo: {e}")
 
 
 # ── EXTRAIR ctwa_clid DO PAYLOAD DO CHATWOOT ──────────────────────────────────
